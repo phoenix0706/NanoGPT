@@ -1,0 +1,259 @@
+#This script implements Multi headed self attention, feedforward layers of transformers block
+# Optimizations added; Residual connections, layernormalization added 
+
+# We always start with a dataset to train on. Let's download the tiny shakespeare dataset
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+#Hyperparameters
+batch_size=64  #number of independent sequences we'll process in parallel
+block_size=256 #maximum context length for prediction
+max_iters= 5000 # number of training steps
+eval_interval=500 #print losses after every 500 iterations
+learning_rate=3e-4
+device='cuda' if torch.cuda.is_available() else 'cpu'
+eval_iters=200 # number of batches used for loss estimation in eval mode
+n_embed=384 # every head 384/6=64 dimension
+n_head=6
+n_layer=6
+dropout=0.2
+torch.manual_seed(1337)
+
+
+path="./tinyshakespeare/input.txt"
+with open(path,'r', encoding='utf-8') as f:
+    text=f.read()
+
+
+# all the unique chars
+chars=sorted(list(set(text)))
+vocab_size=len(chars)
+# mapping from chars to integers
+stoi={ch:i for i, ch in enumerate(chars)}
+itos={i:ch for i, ch in enumerate(chars)}
+ 
+encode= lambda s: [stoi[c] for c in s]  #converts text to list of integers
+decode= lambda l: "".join([itos[i] for i in l]) # converts list of integers into text
+
+
+data=torch.tensor(encode(text), dtype=torch.long)
+n=int(0.9*len(data))  #90% data used for training, 10% for validation
+train_data=data[:n]
+val_data=data[n:]
+# block_size=8
+train_data[:block_size+1]
+x=train_data[:block_size]
+y=train_data[1:block_size+1]
+
+
+def get_batch(split):
+    # generate a small batch of data of inputs x and targets y
+    data= train_data if split=='train' else val_data
+    ix=torch.randint(len(data)-block_size,(batch_size, )) 
+    # batch size number of random offsets
+    # ix will be 4 random numbers between 0 and len(data)-block_size
+    x=torch.stack([data[i:i+block_size] for i in ix]) 
+    #generating chunks for every  i in ix, we stack them up as rows
+    y=torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x,y=x.to(device), y.to(device)
+    return x,y
+
+# no training (grad calculation disabled)
+@torch.no_grad()
+def estimate_loss():
+    out={}
+    model.eval()
+    for split in ['train', 'val']:
+        losses=torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X,Y=get_batch(split)
+            logits, loss=model(X,Y)
+            losses[k]=loss.item()
+        out[split]=losses.mean()
+    model.train()
+    return out
+
+# class LayerNormalization:
+#     def __init__(self, dim, eps=1e-6, momentum=0.1):
+#         self.eps=eps
+#         self.gamma=torch.ones(dim)
+#         self.beta=torch.zeros(dim)
+
+#     def __call__(self, x):
+#         # calculate the forward pass 
+#         xmean=x.mean(1, keepdim=True) #batch mean
+#         xvar=x.var(1, keepdim=True) # batch variance
+#         xhat=(x-xmean)/torch.sqrt(xvar+self.eps) #normalize to unit variance
+#         self.out=self.gamma+xhat+self.beta
+#         return self.out 
+    
+#     def parameters(self):
+#         return [self.gamma, self.beta]
+    
+
+class Head(nn.Module):
+    """One head of self-attention"""
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.key=nn.Linear(n_embed, head_size, bias=False)
+        self.query=nn.Linear(n_embed, head_size, bias=False)
+        self.value=nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.dropout=nn.Dropout(dropout)
+
+    def forward(self, x):
+        B,T,C=x.shape
+        k=self.key(x) # (B, T, C)
+        q=self.query(x) # (B, T, C)
+        #compute attention scores ("affinities")
+        wei=q @ k.transpose(-2,-1)*C**-0.5  # scaled attention
+        #(B,T, C) @ (B, T, C) --> (B, T, T)
+        wei=wei.masked_fill(self.tril[:T, :T]==0, float("-inf") )
+        wei=F.softmax(wei, dim=-1) #(B, T, T)
+        # perform the weighted aggregation of the values
+        wei=self.dropout(wei)
+        v=self.value(x) #(B, T, C)
+        out=wei@v
+        return out 
+    
+class MultiHeadAttention(nn.Module):
+    "Multiple heads of self-attention in parallel."
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads=nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj=nn.Linear(n_embed, n_embed)
+        self.dropout=nn.Dropout(dropout)
+
+    def forward(self, x):
+        out=torch.cat([h(x) for h in self.heads], dim=-1)
+        out=self.dropout(self.proj(out))
+        return out
+    
+
+class FeedForward(nn.Module):
+    """ a simple linear layer followed by a non linearity"""
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net=nn.Sequential(
+        nn.Linear(n_embed, 4*n_embed),
+        nn.ReLU(),
+        nn.Linear(4*n_embed, n_embed),  
+        nn.Dropout(dropout),
+)
+    
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation"""
+    def __init__(self, n_embed, n_head):
+        super().__init__()
+        head_size=n_embed//n_head
+        self.sa=MultiHeadAttention(n_head, head_size)
+        self.ffwd=FeedForward(n_embed)
+        self.ln1=nn.LayerNorm(n_embed)
+        self.ln2=nn.LayerNorm(n_embed)
+    
+    def forward(self, x):
+        x=x+ self.sa(self.ln1(x)) #residual connections
+        x= x + self.ffwd(self.ln2(x)) # residual connections
+        return x
+
+# simple bigram model
+# this model predicts next character based only on current character
+class BigramLanguageModel(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        # each token directly reads off the logits for the next token from a lookup table
+        self.token_embedding_table=nn.Embedding(vocab_size, n_embed) 
+        # 24 will go and pluck out 24th row, similarly 48th will go and pluck out 48th row 
+        # and then arrange them as B,T,C 
+        self.position_embedding_table=nn.Embedding(block_size, n_embed)
+        self.sa_heads=MultiHeadAttention(4, n_embed//4) # i.e. 4 heads of 8 dimensional self attention
+        self.blocks=nn.Sequential(*[Block(n_embed, n_head=n_head) for _ in range(n_layer)]) 
+        self.ln_f=nn.LayerNorm(n_embed) #final layer norm 
+
+        #this doesn't gives good enough results
+        # the reason being it's very deep neural network
+        # so we need to implement optimizations, 
+        # first optimization-> residual connections,
+        # from transformers we'll borrow optimization, skip connections
+        self.ffwd=FeedForward(n_embed)
+        # second optimization-> layernorm
+        self.ln_f=nn.LayerNorm(n_embed) #final layer norm
+        self.lm_head=nn.Linear(n_embed, vocab_size)
+    
+
+    def forward(self, idx, targets=None):
+        B, T= idx.shape
+        # idx and targets are both (B, T) tensor of integers
+        tok_emb=self.token_embedding_table(idx) # (B,T,C)
+        pos_emb=self.position_embedding_table(torch.arange(T, device=device)) #(T,C)
+        x=tok_emb+pos_emb # (B, T, C)
+        x=self.sa_heads(x) # apply one head of self-attention. (B, T, C)
+        x=self.ffwd(x)
+        logits=self.lm_head(x) #(B, T, vocab_size)
+
+        
+        if targets is None:
+            loss=None
+        else: 
+            B, T, C=logits.shape
+            logits=logits.view(B*T, C) 
+            targets=targets.view(B*T)
+            loss=F.cross_entropy(logits, targets)
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        # idx is (B,T) array of indices in the current context
+        # job of generator is to take (B,T) and generate (B,T)+1, (B,T)+2 and so on 
+        # as many max new tokens
+        for _ in range(max_new_tokens): 
+            #crop idx to the last block_size tokens
+            idx_cond=idx[:, -block_size:] #keep only latest context tokens (context length=8)
+            #get the predictions
+            logits, loss=self(idx_cond) #get predictions
+            # focus only on the last time step
+            logits=logits[:, -1,:] # (B,C)  
+            # take only last token's prediction
+            # apply softmax to get probabilities
+            probs=F.softmax(logits, dim=-1) #(B,C)
+            # sample from the distribution
+            idx_next=torch.multinomial(probs, num_samples=1) # (B,1)
+            # append sampled index to the running sequence
+            idx=torch.cat((idx, idx_next), dim=1) # (B, T+1)
+        return idx
+            
+    
+model=BigramLanguageModel() 
+model=model.to(device)
+print(sum(p.numel() for p in model.parameters()/1e6),"M parameters")
+
+
+#create a Pytorch optimizer
+optimizer=torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+for iter in range(max_iters):
+    # every once iinn while evaluate the loss on train and val sets
+    if iter % eval_interval==0:
+        losses=estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+    
+    # sample a batch of data
+    xb,yb=get_batch('train')
+    # evaluate the loss
+    logits, loss=model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+# generate from the model
+context=torch.zeros((1,1), dtype=torch.long)
+print(decode(model.generate(context,max_new_tokens=100)[0].tolist()))
+
+# our model doesn't do anything 
+# it has just nn.embedding there's no feedforward layer, batch norm layer etc nothing
+# we're not calling backward i.e. no backpropogation, torch.nograd() is there 
